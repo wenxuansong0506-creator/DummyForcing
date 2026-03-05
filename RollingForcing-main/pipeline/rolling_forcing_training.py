@@ -444,7 +444,10 @@ class RollingForcingTrainingPipeline:
                 "k": torch.zeros([batch_size, self.kv_cache_size, 12, 128], dtype=dtype, device=device),
                 "v": torch.zeros([batch_size, self.kv_cache_size, 12, 128], dtype=dtype, device=device),
                 "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
-                "local_end_index": torch.tensor([0], dtype=torch.long, device=device)
+                "local_end_index": torch.tensor([0], dtype=torch.long, device=device),
+                "frame_attn_score": None,
+                "headgroup_sink": None,
+                "headgroup_mid": None
             })
 
         self.kv_cache_clean = kv_cache_clean  # always store the clean cache

@@ -123,6 +123,9 @@ class CausalInferencePipeline(torch.nn.Module):
                     [0], dtype=torch.long, device=noise.device)
                 self.kv_cache_clean[block_index]["local_end_index"] = torch.tensor(
                     [0], dtype=torch.long, device=noise.device)
+                self.kv_cache_clean[block_index]["frame_attn_score"] = None
+                self.kv_cache_clean[block_index]["headgroup_sink"] = None
+                self.kv_cache_clean[block_index]["headgroup_mid"] = None
 
         # Step 2: Cache context feature
         if initial_latent is not None:
@@ -352,7 +355,10 @@ class CausalInferencePipeline(torch.nn.Module):
                 "k": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
                 "v": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
                 "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
-                "local_end_index": torch.tensor([0], dtype=torch.long, device=device)
+                "local_end_index": torch.tensor([0], dtype=torch.long, device=device),
+                "frame_attn_score": None,
+                "headgroup_sink": None,
+                "headgroup_mid": None
             })
 
         self.kv_cache_clean = kv_cache_clean  # always store the clean cache

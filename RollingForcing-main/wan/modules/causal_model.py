@@ -16,6 +16,7 @@ import torch.nn as nn
 import torch
 import math
 import torch.distributed as dist
+from wan.modules.dummyforcing import online_head_classification, heterogeneous_memory_allocation, dynamic_head_programming
 
 # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
 # see https://github.com/pytorch/pytorch/issues/133254
@@ -75,6 +76,7 @@ class CausalWanSelfAttention(nn.Module):
         self.frame_length = 1560
         self.max_attention_size = 21 * self.frame_length
         self.block_length = 3 * self.frame_length
+        self.head_accel_start = 2
 
         # layers
         self.q = nn.Linear(dim, dim)
@@ -281,23 +283,99 @@ class CausalWanSelfAttention(nn.Module):
                     anchor_cache_v = kv_cache["v"][:, :self.block_length]
 
                     # 3. attention with working cache and anchor cache
-                    input_key = torch.cat([
-                        anchor_cache_key,
-                        working_cache_key,
-                        roped_key
-                    ], dim=1)
+                    # Build the full KV only when we need fallback/scoring.
+                    input_key = None
+                    input_v = None
 
-                    input_v = torch.cat([
-                        anchor_cache_v,
-                        working_cache_v,
-                        v
-                    ], dim=1)
+                    if (
+                        current_start_frame >= self.head_accel_start
+                        and (kv_cache.get('frame_attn_score', None) is None)
+                    ):
+                        input_key = torch.cat([
+                            anchor_cache_key,
+                            working_cache_key,
+                            roped_key
+                        ], dim=1)
+                        kv_cache['frame_attn_score'] = online_head_classification(
+                            roped_query,
+                            input_key,
+                            anchor_cache_key.shape[1],
+                            working_cache_key.shape[1]
+                        )
 
-                    x = attention(
-                        roped_query,
-                        input_key,
-                        input_v
+                    headgroup_sink = kv_cache.get('headgroup_sink', None)
+                    headgroup_mid = kv_cache.get('headgroup_mid', None)
+
+                    # If global allocation has not happened yet, create a provisional
+                    # per-layer grouping once this layer has a frame attention score.
+                    if (
+                        (headgroup_sink is None or headgroup_mid is None)
+                        and (kv_cache.get('frame_attn_score', None) is not None)
+                    ):
+                        # frame_attn_score: [3, B, H] -> probs: [1, H, 3]
+                        probs = kv_cache['frame_attn_score'].permute(1, 2, 0)
+                        num_heads = probs.shape[1]
+                        local_num_dummy = max(1, num_heads // 4)
+                        group_sink_dict, group_mid_dict = dynamic_head_programming(
+                            probs,
+                            num_dummy=local_num_dummy,
+                        )
+                        kv_cache['headgroup_sink'] = group_sink_dict[0]
+                        kv_cache['headgroup_mid'] = group_mid_dict[0]
+                        headgroup_sink = kv_cache['headgroup_sink']
+                        headgroup_mid = kv_cache['headgroup_mid']
+
+                    use_grouped_attention = (
+                        headgroup_sink is not None
+                        and headgroup_mid is not None
+                        and len(headgroup_sink) > 0
+                        and len(headgroup_mid) > 0
                     )
+
+                    if use_grouped_attention:
+                        q_sink = roped_query[:, :, headgroup_sink, :]
+                        q_mid = roped_query[:, :, headgroup_mid, :]
+
+                        k_sink = torch.cat([
+                            anchor_cache_key[:, :, headgroup_sink, :],
+                            roped_key[:, :, headgroup_sink, :]
+                        ], dim=1)
+                        v_sink = torch.cat([
+                            anchor_cache_v[:, :, headgroup_sink, :],
+                            v[:, :, headgroup_sink, :]
+                        ], dim=1)
+                        k_mid = torch.cat([
+                            working_cache_key[:, :, headgroup_mid, :],
+                            roped_key[:, :, headgroup_mid, :]
+                        ], dim=1)
+                        v_mid = torch.cat([
+                            working_cache_v[:, :, headgroup_mid, :],
+                            v[:, :, headgroup_mid, :]
+                        ], dim=1)
+
+                        x_sink = attention(q_sink, k_sink, v_sink)
+                        x_mid = attention(q_mid, k_mid, v_mid)
+                        x = torch.empty_like(roped_query)
+                        x[:, :, headgroup_sink, :] = x_sink
+                        x[:, :, headgroup_mid, :] = x_mid
+                    else:
+                        if input_key is None:
+                            input_key = torch.cat([
+                                anchor_cache_key,
+                                working_cache_key,
+                                roped_key
+                            ], dim=1)
+                        if input_v is None:
+                            input_v = torch.cat([
+                                anchor_cache_v,
+                                working_cache_v,
+                                v
+                            ], dim=1)
+                        x = attention(
+                            roped_query,
+                            input_key,
+                            input_v
+                        )
                  
 
         # output
@@ -902,6 +980,13 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     }
                 )
                 x = block(x, **kwargs)
+
+        if (
+            kv_cache is not None
+            and all(cache.get('frame_attn_score', None) is not None for cache in kv_cache)
+            and not all(cache.get('headgroup_sink', None) is not None for cache in kv_cache)
+        ):
+            heterogeneous_memory_allocation(kv_cache, num_dummy=180)
 
         # head
         x = self.head(x, e.unflatten(dim=0, sizes=t.shape).unsqueeze(2))
